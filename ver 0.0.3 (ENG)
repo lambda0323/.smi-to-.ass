@@ -1,0 +1,436 @@
+# smi_to_ass_converter.py
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import re
+import chardet
+import html
+from datetime import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QLineEdit, QPushButton, QFileDialog,
+    QSpinBox, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QMessageBox, QCheckBox, QFontComboBox
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFontDatabase
+
+def load_custom_fonts():
+    """
+    Loads custom font files added by the user and registers them with the system.
+    When packaged as an app, it uses the 'fonts' folder in the same directory as the executable.
+    """
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+    else:
+        base_path = os.getcwd()
+    font_dir = os.path.join(base_path, "fonts")
+    if not os.path.exists(font_dir):
+        os.makedirs(font_dir)
+    font_db = QFontDatabase()
+    for file in os.listdir(font_dir):
+        if file.lower().endswith(('.ttf', '.otf')):
+            font_path = os.path.join(font_dir, file)
+            font_db.addApplicationFont(font_path)
+
+def get_font_list():
+    """
+    Constructs and returns the list of fonts to display.
+    Preferred fonts are prioritized.
+    """
+    preferred_fonts = ["Apple SD Gothic Neo", "Hiragino Sans", "Helvetica Neue"]
+    font_db = QFontDatabase()
+    available_fonts = font_db.families()
+    
+    # Prioritize preferred fonts
+    font_list = [font for font in preferred_fonts if font in available_fonts]
+    remaining_fonts = [font for font in available_fonts if font not in font_list]
+    
+    return font_list + remaining_fonts
+
+def detect_encoding(file_path):
+    """
+    Detects and returns the file encoding using chardet.
+    """
+    with open(file_path, 'rb') as f:
+        raw_data = f.read()
+    result = chardet.detect(raw_data)
+    return result['encoding'] if result['encoding'] else 'utf-8'
+
+def ms_to_ass_time(ms):
+    """
+    Converts milliseconds to ASS time format (h:mm:ss.xx).
+    """
+    total_seconds = ms / 1000
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = (total_seconds % 60)
+    return f"{hours}:{minutes:02d}:{seconds:05.2f}"
+
+def convert_color_to_ass(hex_color):
+    """
+    Converts a color in #RRGGBB format to ASS override tag format &HBBGGRR&.
+    For example: #33BEF1 -> &HF1BE33&
+    """
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) != 6:
+        return ""
+    r = hex_color[0:2]
+    g = hex_color[2:4]
+    b = hex_color[4:6]
+    return f"&H{b}{g}{r}&"
+
+def parse_smi_content(smi_text, override_fontsize=None):
+    """
+    Parses SMI text and returns a list in the following format:
+      [
+        {
+          'start': <milliseconds>,
+          'text': <subtitle text with ASS override tags>
+        },
+        ...
+      ]
+
+    - Splits sections using the <SYNC START=...> tag.
+    - Converts <font> tags to ASS override tags (color=#..., size="...").
+      * If override_fontsize is provided, it replaces the size specified in the SMI.
+    - Replaces <br> tags with ASS line breaks (\\N).
+    - For multiple lines (e.g. Japanese + Korean), inserts {\\r} at the beginning of subsequent lines to reset the style.
+      Also applies individual font tags for each line.
+    """
+    # 1) Extract <SYNC START=...> blocks
+    sync_pattern = re.compile(
+        r'<SYNC START\s*=\s*(\d+)[^>]*>(.*?)((?=<SYNC)|$)',
+        re.IGNORECASE | re.DOTALL
+    )
+    # 2) Parse <font ...>...</font> tags
+    font_pattern = re.compile(
+        r'<font\s+([^>]+)>(.*?)</font\s*>',
+        re.IGNORECASE | re.DOTALL
+    )
+    # 3) Replace <br> with \N
+    br_pattern = re.compile(r'<br\s*/?>', re.IGNORECASE)
+    # 4) Pattern to remove other HTML tags
+    tag_pattern = re.compile(r'</?[^>]+>', re.DOTALL)
+
+    events = []
+    for match in sync_pattern.finditer(smi_text):
+        start_ms = int(match.group(1))
+        block_text = match.group(2)
+
+        # (A) Convert HTML entities (e.g. &nbsp;) to actual characters
+        block_text = html.unescape(block_text)
+
+        # (B) Replace <br> with \N
+        block_text = br_pattern.sub(r'\\N', block_text)
+
+        # (C) Process <font> tags
+        def font_replacer(font_match):
+            attr_text = font_match.group(1)  # e.g., color=#33BEF1 size="30"
+            inner_text = font_match.group(2)  # the text content
+
+            color_match = re.search(r'color\s*=\s*["\']?(#[0-9A-Fa-f]{6})["\']?', attr_text)
+            size_match = re.search(r'size\s*=\s*["\']?(\d+)["\']?', attr_text)
+
+            color_tag = ""
+            size_tag = ""
+
+            if color_match:
+                ass_color = convert_color_to_ass(color_match.group(1))
+                if ass_color:
+                    color_tag = f"{{\\1c{ass_color}}}"  # {\1c&Hxx&}
+
+            if size_match:
+                if override_fontsize is not None:
+                    size_tag = f"{{\\fs{override_fontsize}}}"
+                else:
+                    size_val = size_match.group(1)
+                    size_tag = f"{{\\fs{size_val}}}"
+
+            # Append {\\r} to reset style after the text
+            return f"{color_tag}{size_tag}{inner_text}{{\\r}}"
+
+        # Process each line split by \N
+        lines = block_text.split('\\N')
+        processed_lines = []
+        for i, line in enumerate(lines):
+            line = font_pattern.sub(font_replacer, line)
+            line = tag_pattern.sub('', line).strip()
+            if i > 0 and not line.startswith("{\\r}"):
+                line = "{\\r}" + line
+            processed_lines.append(line)
+
+        block_text = '\\N'.join(processed_lines)
+
+        if not block_text.strip():
+            continue
+
+        events.append({
+            'start': start_ms,
+            'text': block_text
+        })
+    return events
+
+def build_ass_file(events, default_font='Arial', default_fontsize=20, last_duration=5000):
+    """
+    Generates the ASS file content based on the parsed events list.
+    last_duration specifies the duration of the last subtitle in milliseconds.
+
+    - events: [
+        { 'start': 1000, 'text': 'Subtitle 1' },
+        { 'start': 3000, 'text': 'Subtitle 2' },
+        ...
+      ]
+    """
+    ass_header = f"""[Script Info]
+; Script generated by SMI-to-ASS Converter
+ScriptType: v4.00+
+Collisions: Normal
+PlayResX: 1280
+PlayResY: 720
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{default_font},{default_fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    ass_lines = [ass_header]
+
+    for i in range(len(events)):
+        start_ms = events[i]['start']
+        text = events[i]['text']
+
+        # Maintain subtitle until just before the next event, or use last_duration if none
+        if i < len(events) - 1:
+            end_ms = events[i+1]['start'] - 1
+            if end_ms < start_ms:
+                end_ms = start_ms + 1000
+        else:
+            end_ms = start_ms + last_duration
+
+        start_str = ms_to_ass_time(start_ms)
+        end_str = ms_to_ass_time(end_ms)
+
+        dialogue_line = f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text}"
+        ass_lines.append(dialogue_line)
+
+    return "\n".join(ass_lines)
+
+def convert_smi_to_ass(input_path, output_path, default_font='Arial', default_fontsize=20, last_duration=5, override_fontsize=None):
+    """
+    Reads the specified SMI file, converts it to an ASS file, and saves it to output_path.
+    last_duration is provided in seconds for the last subtitle.
+    If override_fontsize is specified, it overrides the font size in the SMI file.
+    """
+    try:
+        encoding = detect_encoding(input_path)
+        with open(input_path, 'r', encoding=encoding, errors='replace') as f:
+            smi_text = f.read()
+
+        events = parse_smi_content(smi_text, override_fontsize=override_fontsize)
+
+        ass_str = build_ass_file(
+            events,
+            default_font=default_font,
+            default_fontsize=default_fontsize,
+            last_duration=last_duration * 1000
+        )
+
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        ass_filename = base_name + ".ass"
+        output_file = os.path.join(output_path, ass_filename)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(ass_str)
+
+        return True, f"Conversion successful: {output_file}"
+    except Exception as e:
+        return False, str(e)
+
+def log_error(message):
+    """
+    Logs errors to error_log.txt in the format [YYYY-MM-DD HH:MM:SS.ms].
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_line = f"[{now}] {message}\n"
+    with open("error_log.txt", "a", encoding="utf-8") as f:
+        f.write(log_line)
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SMI to ASS Converter")
+        self.resize(600, 400)
+
+        load_custom_fonts()
+        available_fonts = get_font_list()
+
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout()
+        central_widget.setLayout(main_layout)
+
+        # Source selection group
+        source_group = QGroupBox("Select Source", self)
+        source_layout = QHBoxLayout()
+        source_group.setLayout(source_layout)
+
+        self.edit_source = QLineEdit(self)
+        source_layout.addWidget(self.edit_source)
+
+        self.btn_source_file = QPushButton("Select File", self)
+        self.btn_source_file.clicked.connect(self.select_source_file)
+        source_layout.addWidget(self.btn_source_file)
+
+        self.btn_source_dir = QPushButton("Select Folder", self)
+        self.btn_source_dir.clicked.connect(self.select_source_dir)
+        source_layout.addWidget(self.btn_source_dir)
+
+        main_layout.addWidget(source_group)
+
+        # Output path group
+        output_group = QGroupBox("Output Path", self)
+        output_layout = QHBoxLayout()
+        output_group.setLayout(output_layout)
+
+        self.edit_output = QLineEdit(self)
+        output_layout.addWidget(self.edit_output)
+
+        self.btn_output_dir = QPushButton("Select Folder", self)
+        self.btn_output_dir.clicked.connect(self.select_output_dir)
+        output_layout.addWidget(self.btn_output_dir)
+
+        main_layout.addWidget(output_group)
+
+        # Options group (Font, Size, Subtitle Duration, Override Font Size)
+        option_group = QGroupBox("Options", self)
+        option_layout = QVBoxLayout()
+        option_group.setLayout(option_layout)
+
+        # Font selection (QFontComboBox)
+        font_layout = QHBoxLayout()
+        font_label = QLabel("Default Font:", self)
+        font_layout.addWidget(font_label)
+        self.font_combo_box = QFontComboBox(self)
+        self.font_combo_box.addItems(available_fonts)
+        self.font_combo_box.setCurrentText("Apple SD Gothic Neo")
+        font_layout.addWidget(self.font_combo_box)
+        option_layout.addLayout(font_layout)
+
+        # Default font size
+        fontsize_layout = QHBoxLayout()
+        fontsize_label = QLabel("Default Size:", self)
+        fontsize_layout.addWidget(fontsize_label)
+        self.spin_fontsize = QSpinBox(self)
+        self.spin_fontsize.setRange(8, 72)
+        self.spin_fontsize.setValue(20)
+        fontsize_layout.addWidget(self.spin_fontsize)
+        option_layout.addLayout(fontsize_layout)
+
+        # Override SMI font size option
+        self.checkbox_override_fontsize = QCheckBox("Ignore SMI font size (use default)", self)
+        option_layout.addWidget(self.checkbox_override_fontsize)
+
+        # Subtitle duration in seconds
+        lastsec_layout = QHBoxLayout()
+        lastsec_label = QLabel("Subtitle Duration (sec):", self)
+        lastsec_layout.addWidget(lastsec_label)
+        self.spin_lastsec = QSpinBox(self)
+        self.spin_lastsec.setRange(1, 30)
+        self.spin_lastsec.setValue(5)
+        lastsec_layout.addWidget(self.spin_lastsec)
+        option_layout.addLayout(lastsec_layout)
+
+        main_layout.addWidget(option_group)
+
+        # Start conversion button
+        self.btn_convert = QPushButton("Start Conversion", self)
+        self.btn_convert.clicked.connect(self.start_conversion)
+        main_layout.addWidget(self.btn_convert, alignment=Qt.AlignCenter)
+
+    def select_source_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select SMI File", "", "SMI Files (*.smi);;All Files (*.*)")
+        if file_path:
+            self.edit_source.setText(file_path)
+
+    def select_source_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if dir_path:
+            self.edit_source.setText(dir_path)
+
+    def select_output_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if dir_path:
+            self.edit_output.setText(dir_path)
+
+    def start_conversion(self):
+        source_path = self.edit_source.text().strip()
+        output_path = self.edit_output.text().strip()
+        font_name = self.font_combo_box.currentFont().family()
+        font_size = self.spin_fontsize.value()
+        last_sec = self.spin_lastsec.value()
+
+        override_fontsize = font_size if self.checkbox_override_fontsize.isChecked() else None
+
+        if not source_path:
+            self.show_error("Source path not set.")
+            return
+        if not output_path:
+            self.show_error("Output path not set.")
+            return
+
+        if os.path.isfile(source_path):
+            success, msg = convert_smi_to_ass(
+                source_path, output_path,
+                default_font=font_name,
+                default_fontsize=font_size,
+                last_duration=last_sec,
+                override_fontsize=override_fontsize
+            )
+            if success:
+                QMessageBox.information(self, "Conversion Complete", msg)
+            else:
+                self.show_error(msg)
+
+        elif os.path.isdir(source_path):
+            converted_count = 0
+            failed_count = 0
+            for root, dirs, files in os.walk(source_path):
+                for fname in files:
+                    if fname.lower().endswith(".smi"):
+                        fpath = os.path.join(root, fname)
+                        success, msg = convert_smi_to_ass(
+                            fpath, output_path,
+                            default_font=font_name,
+                            default_fontsize=font_size,
+                            last_duration=last_sec,
+                            override_fontsize=override_fontsize
+                        )
+                        if success:
+                            converted_count += 1
+                        else:
+                            failed_count += 1
+                            log_error(f"{fpath} conversion failed: {msg}")
+
+            QMessageBox.information(
+                self, "Conversion Complete",
+                f"Total {converted_count} files converted, {failed_count} failures."
+            )
+        else:
+            self.show_error("Invalid file or folder.")
+
+    def show_error(self, msg):
+        QMessageBox.critical(self, "Error", msg)
+        log_error(msg)
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
